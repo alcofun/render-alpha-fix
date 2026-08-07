@@ -1,0 +1,11 @@
+/build/
+/outputs/
+*.user
+*.suo
+*.VC.db
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.obj
+RenderAlphaFix.log
