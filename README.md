@@ -39,7 +39,13 @@ Before rendering an alpha atomic, it validates:
 
 Validation is performed for the entire list before any alpha value is changed. If the list is inconsistent, the affected atomic is skipped for that frame. A damaged object may briefly disappear, but the invalid list is never passed into the RenderWare pipeline.
 
-For valid lists, the plugin stores exact material pointers and alpha values in per-call storage, invokes GTA's original render callback, then restores values in reverse order. The first 152 entries use inline storage; larger lists use dynamically sized storage up to the configured safety limit. Restoration of material alpha and atomic flags is protected with structured exception handling.
+For valid lists, the plugin stores exact material pointers and alpha values in per-call storage, invokes GTA's original render callback, then restores values in reverse order. The first 512 entries use inline storage; larger lists use dynamically sized storage up to the configured safety limit. Restoration of material alpha and atomic flags is protected with structured exception handling.
+
+The normal render path uses guarded memory accesses instead of issuing `VirtualQuery` system calls for every material. Rejection logging is buffered and repeated reports are heavily throttled, keeping disk I/O out of the frame-critical path.
+
+On compatible SA-MP clients, a rejected material list schedules an event-driven object-pool repair. `CObjectPool::Process` and `CObject::ConstructMaterialText` are located through unique code signatures; no SA-MP RVA, PE entry point or global-address table is used. The repair reproduces the invariant used by SAMP AddOn: a material-text slot is malformed when its type is text, its texture-created flag is clear, and its material/background pointer is still populated. Up to five affected objects are rebuilt through SA-MP's own `CObject::ConstructMaterialText`; scanning is rate-limited and never runs during healthy rendering.
+
+This upstream repair targets the shared damaged-resource state associated with failures reported at `0x7324B6` (`CVisibilityPlugins::RenderAlphaAtomic`), `0x81214A` (`RpMatFXMaterialGetEffects`) and `0x756B89` (`_rxD3D9Instance`). It also prevents malformed object resources from propagating into later hierarchy and skinned-frame updates reported at `0x7C5A8B` and `0x4D1996`. The separate `0x7F5A3A` dynamic-vertex-buffer failure is a video-memory exhaustion path and is not treated as the same defect.
 
 Additional safeguards include:
 
@@ -58,7 +64,7 @@ SAMP AddOn is useful prior art and is reported to prevent this crash in supporte
 |---|---|---|
 | Deployment | One single-purpose ASI | Part of a broader client add-on |
 | SA-MP coupling | No `samp.dll` offsets or object layouts | Can depend on supported SA-MP/client layouts |
-| Protection point | Validates the final RenderWare material list | Can repair known object/material states earlier |
+| Protection point | RenderWare containment plus compatible SA-MP object repair | Can repair known object/material states earlier |
 | Raised material counts | Removes the original 152-entry stack overflow | Not the focus of the reported workaround |
 | Failure policy | Skips one unsafe atomic for the current frame | Upstream repair may preserve the object |
 | Diagnostics | Signature checks, self-tests, rejection log | Depends on the add-on build |
@@ -70,9 +76,12 @@ This does not make either design universally superior. Repairing bad SA-MP objec
 - GTA San Andreas 1.0 US (Hoodlum executable layout)
 - 32-bit Windows process
 - any compatible x86 ASI loader
-- SA-MP and custom clients that preserve the verified GTA code signatures
+- all SA-MP/custom clients that preserve the verified GTA code signatures for renderer containment
+- upstream repair signature-tested against SA-MP 0.3.7-R1 and 0.3.7-R3
 
-Unknown executables are not patched. A signature mismatch is written to the log and initialization stops safely.
+R2 and R4 are expected to share the matched compiler/layout pattern, but have not been run in a real client. The repair is enabled only when both long signatures are unique in the loaded module; otherwise renderer containment stays active and the optional SA-MP repair is disabled.
+
+Unknown GTA executables are not patched. An unknown or substantially modified `samp.dll` keeps renderer containment active but disables the optional object repair.
 
 ## Installation
 
@@ -112,6 +121,8 @@ For initial deployment, use a separate game copy and temporarily remove other an
 
 The repository also contains a mock GTA host used during development. It verifies game-loop chaining, hook installation, in-game self-test completion, valid alpha restoration, and rejection of the observed `RpMaterial*=1` case.
 
+The regression suite also covers the field-observed `0xC1000000` material value and the malformed SA-MP material-text slot invariant used to schedule object reconstruction.
+
 ## Building
 
 Clone the repository with submodules, then build the Win32 target with MSVC:
@@ -125,9 +136,17 @@ cmake --build build --config Release
 
 The resulting plugin is `build/Release/RenderAlphaFix.asi`. The MSVC runtime is linked statically.
 
+To build the mock host as well:
+
+```bat
+cmake -S . -B build-tests -G "Visual Studio 18 2026" -A Win32 -DRENDER_ALPHA_FIX_BUILD_TESTS=ON
+cmake --build build-tests --config Release
+build-tests\Release\mock_host.exe build-tests\Release\RenderAlphaFix.asi
+```
+
 ## Limitations
 
-Windows page validation can reject null, low, inaccessible and protection-incompatible pointers. It cannot prove that an object in otherwise committed memory is still logically alive. The plugin therefore contains the renderer crash but does not replace a proper fix for the upstream object-lifetime bug.
+Guarded reads and writes reject null, low and inaccessible pointers, but they cannot prove that an object in otherwise accessible memory is still logically alive. Renderer containment therefore remains a last line of defence. The optional SA-MP repair addresses the known malformed material-text state only on the explicitly supported object layout.
 
 Hot-unloading is not supported. The plugin is pinned until process exit. GTA's original RenderWare path is expected to execute on the game render thread; custom multithreaded renderers are outside the supported configuration.
 

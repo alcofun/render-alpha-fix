@@ -107,9 +107,13 @@ int wmain(int argc, wchar_t** argv) {
 
     materialPointer = reinterpret_cast<std::uint8_t*>(1);
     render(atomic, 128);
-    const bool rejected = g_renderCalls == 1;
+    const bool rejectedLow = g_renderCalls == 1;
+    materialPointer = reinterpret_cast<std::uint8_t*>(0xC1000000);
+    render(atomic, 128);
+    const bool rejectedHigh = g_renderCalls == 1;
     std::wprintf(L"mock host: gameloop=PASS hook=PASS in_game_selftest=%ls valid_restore=%ls "
-                 L"invalid_pointer_1=%ls\n", inGameSelfTest ? L"PASS" : L"FAIL",
-                 restored ? L"PASS" : L"FAIL", rejected ? L"PASS" : L"FAIL");
-    return inGameSelfTest && restored && rejected ? 0 : 6;
+                 L"invalid_pointer_1=%ls invalid_pointer_C1000000=%ls\n",
+                 inGameSelfTest ? L"PASS" : L"FAIL", restored ? L"PASS" : L"FAIL",
+                 rejectedLow ? L"PASS" : L"FAIL", rejectedHigh ? L"PASS" : L"FAIL");
+    return inGameSelfTest && restored && rejectedLow && rejectedHigh ? 0 : 6;
 }

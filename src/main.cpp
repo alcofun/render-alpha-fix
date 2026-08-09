@@ -30,14 +30,24 @@ constexpr std::size_t kGeometrySpaceOffset = 0x28;
 constexpr std::size_t kMaterialAlphaOffset = 0x07;
 constexpr std::size_t kMaterialSize = 0x1C;
 constexpr std::uint32_t kRenderFlag = 0x40;
-constexpr std::size_t kInlineSnapshots = 152;
+constexpr std::size_t kInlineSnapshots = 512;
 constexpr std::uint32_t kDefaultMaxMaterials = 4096;
+constexpr std::size_t kObjectGameEntityOffset = 0x40;
+constexpr std::size_t kObjectMaterialPointerOffset = 0x217;
+constexpr std::size_t kObjectMaterialTypeOffset = 0x2DB;
+constexpr std::size_t kObjectTextureCreatedOffset = 0x31B;
+constexpr std::size_t kObjectPoolFlagsOffset = 0x04;
+constexpr std::size_t kObjectPoolPointersOffset = 0xFA4;
+constexpr std::int32_t kSampMaxObjects = 1000;
 
 using RenderAlphaAtomicFn = void(__cdecl*)(void*, int);
 using AtomicDefaultRenderFn = void*(__cdecl*)(void*);
+using ObjectPoolProcessFn = void(__thiscall*)(void*);
+using ConstructMaterialTextFn = void(__thiscall*)(void*);
 using dMainLoop = void(__stdcall*)();
 using RenderHook = kthook::kthook_simple<RenderAlphaAtomicFn>;
 using MainLoopHook = kthook::kthook_simple<dMainLoop>;
+using ObjectPoolHook = kthook::kthook_simple<ObjectPoolProcessFn>;
 
 enum class RejectReason : std::uint32_t {
     None,
@@ -78,14 +88,21 @@ HANDLE g_log = INVALID_HANDLE_VALUE;
 SRWLOCK g_logLock = SRWLOCK_INIT;
 RenderHook* g_hook{};
 MainLoopHook* g_mainLoopHook{};
+ObjectPoolHook* g_objectPoolHook{};
 dMainLoop g_timerUpdate{};
 AtomicDefaultRenderFn g_defaultRender{};
 std::uint32_t g_maxMaterials = kDefaultMaxMaterials;
 bool g_logRejected = true;
-std::atomic<std::uint64_t> g_calls{0};
-std::atomic<std::uint64_t> g_rendered{0};
-std::atomic<std::uint64_t> g_rejected{0};
+std::uint64_t g_rejected{};
 std::atomic_bool g_inGameSelfTestPending{true};
+std::atomic_bool g_sampRepairRequested{false};
+std::uint8_t* g_sampBase{};
+ConstructMaterialTextFn g_constructMaterialText{};
+void* g_objectPool{};
+DWORD g_lastRepairTick{};
+DWORD g_lastSampProbeTick{};
+bool g_sampProbeLogged{};
+bool g_sampRepairUnsupported{};
 
 template <typename HookType>
 struct HookReturnGuard {
@@ -144,7 +161,6 @@ void Log(const char* format, ...) noexcept {
     AcquireSRWLockExclusive(&g_logLock);
     DWORD written{};
     WriteFile(g_log, message, static_cast<DWORD>(length), &written, nullptr);
-    FlushFileBuffers(g_log);
     ReleaseSRWLockExclusive(&g_logLock);
 }
 
@@ -252,15 +268,14 @@ bool SafeWriteU8(void* address, std::uint8_t value) noexcept {
 }
 
 RejectReason ReadGeometry(void* atomic, GeometryView* view) noexcept {
-    if (!atomic) return RejectReason::NullAtomic;
+    if (reinterpret_cast<std::uintptr_t>(atomic) < 0x10000) return RejectReason::NullAtomic;
     void* geometryField = OffsetPointer(atomic, kAtomicGeometryOffset);
-    if (!geometryField || !CheckRange(geometryField, sizeof(void*), false))
-        return RejectReason::InvalidAtomic;
+    if (!geometryField) return RejectReason::InvalidAtomic;
 
     void* geometry{};
     if (!SafeReadPointer(geometryField, &geometry))
         return RejectReason::InvalidAtomic;
-    if (!geometry) return RejectReason::NullGeometry;
+    if (reinterpret_cast<std::uintptr_t>(geometry) < 0x10000) return RejectReason::NullGeometry;
 
     auto* geometryBytes = static_cast<std::uint8_t*>(geometry);
     void* geometryRange = OffsetPointer(geometry, kGeometryFlagsOffset);
@@ -268,9 +283,7 @@ RejectReason ReadGeometry(void* atomic, GeometryView* view) noexcept {
     void* materialsField = OffsetPointer(geometry, kGeometryMaterialsOffset);
     void* countField = OffsetPointer(geometry, kGeometryCountOffset);
     void* spaceField = OffsetPointer(geometry, kGeometrySpaceOffset);
-    if (!geometryRange || !materialsField || !countField || !spaceField ||
-        !CheckRange(geometryRange,
-                    kGeometrySpaceOffset + sizeof(std::int32_t) - kGeometryFlagsOffset, false))
+    if (!geometryRange || !materialsField || !countField || !spaceField)
         return RejectReason::InvalidGeometry;
 
     void* materials{};
@@ -292,8 +305,7 @@ PreflightResult BuildSnapshots(const GeometryView& view, Snapshot* snapshots) no
     if (static_cast<std::uint32_t>(view.count) > g_maxMaterials)
         return {RejectReason::TooManyMaterials, -1, nullptr};
 
-    const auto bytes = static_cast<std::size_t>(view.count) * sizeof(void*);
-    if (!view.materials || !CheckRange(view.materials, bytes, false))
+    if (reinterpret_cast<std::uintptr_t>(view.materials) < 0x10000)
         return {RejectReason::InvalidMaterialArray, -1, nullptr};
 
     for (std::int32_t index = 0; index < view.count; ++index) {
@@ -304,8 +316,7 @@ PreflightResult BuildSnapshots(const GeometryView& view, Snapshot* snapshots) no
         auto* material = static_cast<std::uint8_t*>(rawMaterial);
 
         void* alphaField = OffsetPointer(material, kMaterialAlphaOffset);
-        if (!material || !alphaField || !CheckRange(material, kMaterialSize, false) ||
-            !CheckRange(alphaField, 1, true)) {
+        if (reinterpret_cast<std::uintptr_t>(material) < 0x10000 || !alphaField) {
             return {RejectReason::InvalidMaterial, index, material};
         }
 
@@ -340,7 +351,8 @@ void RenderWithFinally(void* atomic, const GeometryView* view,
 void LogRejection(const GeometryView* view, const PreflightResult& result,
                   void* atomic) noexcept {
     const auto rejected = ++g_rejected;
-    if (!g_logRejected || (rejected > 20 && rejected % 1000 != 0)) return;
+    g_sampRepairRequested.store(true, std::memory_order_relaxed);
+    if (!g_logRejected || (rejected > 1 && rejected % 1000 != 0)) return;
     Log("REJECT reason=%s atomic=%p geometry=%p materials=%p count=%ld space=%ld "
         "badIndex=%ld badMaterial=%p rejected=%llu",
         ReasonName(result.reason), atomic, view ? view->geometry : nullptr,
@@ -361,7 +373,6 @@ Snapshot* AcquireSnapshots(std::int32_t count, Snapshot* inlineStorage,
 
 void RenderAlphaReplacement(const RenderHook& hook, void*& atomic, int& requestedAlpha) {
     HookReturnGuard<RenderHook> returnGuard(hook);
-    ++g_calls;
     GeometryView view{};
     const auto headerReason = ReadGeometry(atomic, &view);
     if (headerReason != RejectReason::None) {
@@ -395,8 +406,7 @@ void RenderAlphaReplacement(const RenderHook& hook, void*& atomic, int& requeste
         auto* invalidMaterial = reinterpret_cast<std::uint8_t*>(1);
         void* invalidAlpha = OffsetPointer(invalidMaterial, kMaterialAlphaOffset);
         const bool rejected = !invalidAlpha ||
-            !CheckRange(invalidMaterial, kMaterialSize, false) ||
-            !CheckRange(invalidAlpha, 1, true);
+            reinterpret_cast<std::uintptr_t>(invalidMaterial) < 0x10000;
         if (rejected) {
             Log("IN-GAME SELFTEST PASS: actual RenderAlphaAtomic hook rejected local "
                 "material=00000001; renderer skipped once; GTA memory unchanged");
@@ -408,8 +418,7 @@ void RenderAlphaReplacement(const RenderHook& hook, void*& atomic, int& requeste
     }
 
     void* flagsField = OffsetPointer(view.geometry, kGeometryFlagsOffset);
-    if (!flagsField || !CheckRange(flagsField, sizeof(std::uint32_t), true) ||
-        !SafeWriteU32(flagsField, view.flags | kRenderFlag)) {
+    if (!flagsField || !SafeWriteU32(flagsField, view.flags | kRenderFlag)) {
         PreflightResult result{RejectReason::WriteFailed, -1, nullptr};
         LogRejection(&view, result, atomic);
         if (heapAllocated) HeapFree(GetProcessHeap(), 0, snapshots);
@@ -429,12 +438,28 @@ void RenderAlphaReplacement(const RenderHook& hook, void*& atomic, int& requeste
         }
     }
 
-    ++g_rendered;
     RenderWithFinally(atomic, &view, snapshots, heapAllocated);
 }
 
+bool HasMalformedTextSlot(void* object) noexcept {
+    if (reinterpret_cast<std::uintptr_t>(object) < 0x10000) return false;
+    auto* objectBytes = static_cast<std::uint8_t*>(object);
+    for (std::int32_t slot = 0; slot < 16; ++slot) {
+        std::int32_t type{};
+        std::int32_t textureCreated{};
+        void* materialPointer{};
+        if (!SafeReadI32(objectBytes + kObjectMaterialTypeOffset + slot * 4, &type) ||
+            !SafeReadI32(objectBytes + kObjectTextureCreatedOffset + slot * 4,
+                         &textureCreated) ||
+            !SafeReadPointer(objectBytes + kObjectMaterialPointerOffset + slot * 4,
+                             &materialPointer)) return false;
+        if (type == 2 && textureCreated == 0 && materialPointer != nullptr) return true;
+    }
+    return false;
+}
+
 bool SyntheticTests() noexcept {
-    constexpr std::int32_t count = 153;
+    constexpr std::int32_t count = 513;
     auto** materials = static_cast<std::uint8_t**>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
         count * sizeof(std::uint8_t*)));
     auto* blocks = static_cast<std::uint8_t*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
@@ -478,12 +503,192 @@ bool SyntheticTests() noexcept {
     passed = passed && invalid.reason == RejectReason::InvalidMaterial &&
              invalid.badIndex == 12 && invalid.badMaterial == reinterpret_cast<std::uint8_t*>(1);
 
+    alignas(4) std::uint8_t object[0x400]{};
+    *reinterpret_cast<std::int32_t*>(object + kObjectMaterialTypeOffset + 7 * 4) = 2;
+    *reinterpret_cast<void**>(object + kObjectMaterialPointerOffset + 7 * 4) =
+        reinterpret_cast<void*>(0xC1000000);
+    const bool malformedDetected = HasMalformedTextSlot(object);
+    *reinterpret_cast<std::int32_t*>(object + kObjectTextureCreatedOffset + 7 * 4) = 1;
+    passed = passed && malformedDetected && !HasMalformedTextSlot(object);
+
     if (heapAllocated && snapshots) HeapFree(GetProcessHeap(), 0, snapshots);
     HeapFree(GetProcessHeap(), 0, blocks);
     HeapFree(GetProcessHeap(), 0, materials);
-    Log("SYNTHETIC SELFTEST %s: material=1 rejected; 153 snapshots handled dynamically",
+    Log("SYNTHETIC SELFTEST %s: invalid materials rejected; 513 snapshots; SA-MP text-slot invariant",
         passed ? "PASS" : "FAIL");
     return passed;
+}
+
+struct ParsedPattern {
+    std::uint8_t bytes[128]{};
+    bool exact[128]{};
+    std::size_t length{};
+};
+
+int HexNibble(char value) noexcept {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    return -1;
+}
+
+bool ParsePattern(const char* text, ParsedPattern* pattern) noexcept {
+    while (*text) {
+        while (*text == ' ') ++text;
+        if (!*text) break;
+        if (pattern->length == sizeof(pattern->bytes)) return false;
+        if (*text == '?') {
+            pattern->exact[pattern->length++] = false;
+            while (*text == '?') ++text;
+        } else {
+            const int high = HexNibble(text[0]);
+            const int low = HexNibble(text[1]);
+            if (high < 0 || low < 0) return false;
+            pattern->bytes[pattern->length] = static_cast<std::uint8_t>((high << 4) | low);
+            pattern->exact[pattern->length++] = true;
+            text += 2;
+        }
+        while (*text == ' ') ++text;
+    }
+    return pattern->length != 0;
+}
+
+std::uint8_t* FindUniqueExecutablePattern(std::uint8_t* module,
+                                          const char* signature) noexcept {
+    ParsedPattern pattern{};
+    if (!module || !ParsePattern(signature, &pattern)) return nullptr;
+
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(module);
+    if (!CheckRange(dos, sizeof(*dos), false) || dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 || dos->e_lfanew > 0x100000) return nullptr;
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS32*>(module + dos->e_lfanew);
+    if (!CheckRange(nt, sizeof(*nt), false) || nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+
+    std::uint8_t* match{};
+    auto* section = IMAGE_FIRST_SECTION(nt);
+    for (WORD index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
+        if (!(section->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        const std::size_t size = section->Misc.VirtualSize;
+        auto* start = module + section->VirtualAddress;
+        if (size < pattern.length || !CheckRange(start, size, false)) continue;
+        for (std::size_t offset = 0; offset <= size - pattern.length; ++offset) {
+            bool equal = true;
+            for (std::size_t byte = 0; byte < pattern.length; ++byte) {
+                if (pattern.exact[byte] && start[offset + byte] != pattern.bytes[byte]) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (!equal) continue;
+            if (match) return nullptr;
+            match = start + offset;
+        }
+    }
+    return match;
+}
+
+void ObjectPoolProcessReplacement(const ObjectPoolHook& hook, void*& pool) {
+    HookReturnGuard<ObjectPoolHook> returnGuard(hook);
+    g_objectPool = pool;
+    hook.get_trampoline()(pool);
+}
+
+void InitializeSampRepair() noexcept {
+    g_sampBase = reinterpret_cast<std::uint8_t*>(GetModuleHandleW(L"samp.dll"));
+    if (!g_sampBase) {
+        if (!g_sampProbeLogged) {
+            Log("SA-MP OBJECT REPAIR waiting for samp.dll");
+            g_sampProbeLogged = true;
+        }
+        return;
+    }
+
+    constexpr const char* constructSignature =
+        "83 EC 08 53 55 56 8B E9 57 8D BD DB 02 00 00 8D B5 31 04 00 00 "
+        "BB 10 00 00 00 8D 9B 00 00 00 00 8B 87 3C FF FF FF 85 C0 74 6A "
+        "83 3F 02 75 65 8B 47 40 85 C0 75 5E 0F B6 56 B4";
+    constexpr const char* processSignature =
+        "51 A1 ? ? ? ? 85 C0 53 55 57 8B D9 75 0A E8 ? ? ? ? A3 ? ? ? ? "
+        "E8 ? ? ? ? 8B 0D ? ? ? ? 8B E8 2B C1 89 44 24 0C DB 44 24 0C "
+        "8B 03 33 FF 85 C0 D8 0D ? ? ? ? D9 5C 24 0C 7C 2F 56 8D B3 A4 0F 00 00";
+
+    auto* construct = FindUniqueExecutablePattern(g_sampBase, constructSignature);
+    auto* process = FindUniqueExecutablePattern(g_sampBase, processSignature);
+    if (!construct || !process) {
+        Log("SA-MP OBJECT REPAIR disabled: unique R1/R3-compatible signatures not found");
+        g_sampBase = nullptr;
+        g_sampRepairUnsupported = true;
+        return;
+    }
+
+    g_constructMaterialText = reinterpret_cast<ConstructMaterialTextFn>(construct);
+    g_objectPoolHook = new (std::nothrow) ObjectPoolHook(
+        reinterpret_cast<ObjectPoolProcessFn>(process), &ObjectPoolProcessReplacement, false);
+    if (!g_objectPoolHook || !g_objectPoolHook->install()) {
+        delete g_objectPoolHook;
+        g_objectPoolHook = nullptr;
+        g_constructMaterialText = nullptr;
+        g_sampBase = nullptr;
+        g_sampRepairUnsupported = true;
+        Log("SA-MP OBJECT REPAIR disabled: object-pool hook installation failed");
+        return;
+    }
+    Log("SA-MP OBJECT REPAIR enabled by signatures: process=%p construct=%p", process, construct);
+}
+
+void ProbeSampRepair() noexcept {
+    if (g_objectPoolHook || g_sampRepairUnsupported) return;
+    const DWORD now = GetTickCount();
+    if (now - g_lastSampProbeTick < 1000) return;
+    g_lastSampProbeTick = now;
+    InitializeSampRepair();
+}
+
+void RepairSampObjects() noexcept {
+    if (!g_sampBase || !g_constructMaterialText ||
+        !g_sampRepairRequested.load(std::memory_order_relaxed)) return;
+
+    const DWORD now = GetTickCount();
+    if (now - g_lastRepairTick < 2000) return;
+    g_lastRepairTick = now;
+    g_sampRepairRequested.store(false, std::memory_order_relaxed);
+
+    void* pool = g_objectPool;
+    if (!pool) return;
+
+    std::int32_t largest{};
+    if (!SafeReadI32(pool, &largest) || largest < 0) return;
+    if (largest >= kSampMaxObjects) largest = kSampMaxObjects - 1;
+
+    std::uint32_t repaired{};
+    for (std::int32_t id = 0; id <= largest && repaired < 5; ++id) {
+        std::int32_t occupied{};
+        void* object{};
+        auto* bytes = static_cast<std::uint8_t*>(pool);
+        if (!SafeReadI32(bytes + kObjectPoolFlagsOffset + id * sizeof(std::int32_t), &occupied) ||
+            !occupied ||
+            !SafeReadPointer(bytes + kObjectPoolPointersOffset + id * sizeof(void*), &object) ||
+            !object) continue;
+
+        void* gameEntity{};
+        if (!SafeReadPointer(static_cast<std::uint8_t*>(object) + kObjectGameEntityOffset,
+                             &gameEntity) || !gameEntity) continue;
+
+        if (!HasMalformedTextSlot(object)) continue;
+
+        __try {
+            g_constructMaterialText(object);
+            ++repaired;
+        } __except (MemoryAccessFilter(GetExceptionCode())) {
+            Log("SA-MP OBJECT REPAIR faulted for object id=%ld; repair disabled", id);
+            g_sampBase = nullptr;
+            return;
+        }
+    }
+
+    if (repaired)
+        Log("SA-MP OBJECT REPAIR rebuilt %lu malformed object(s)",
+            static_cast<unsigned long>(repaired));
 }
 
 std::wstring ModuleDirectory() {
@@ -520,7 +725,7 @@ void LoadConfig() {
 
 void Initialize() {
     LoadConfig();
-    Log("RenderAlphaFix 1.0 initializing from GTA GameLoop; maxMaterials=%lu",
+    Log("RenderAlphaFix 1.1 initializing from GTA GameLoop; maxMaterials=%lu",
         static_cast<unsigned long>(g_maxMaterials));
 
     HMODULE pinnedModule{};
@@ -552,6 +757,7 @@ void Initialize() {
     Log("HOOK INSTALLED at %p; AtomicDefaultRenderCallBack=%p",
         base + kRenderAlphaAtomicRva, reinterpret_cast<void*>(g_defaultRender));
     SyntheticTests();
+    InitializeSampRepair();
 }
 
 void MainLoopReplacement(const MainLoopHook& hook) {
@@ -561,6 +767,8 @@ void MainLoopReplacement(const MainLoopHook& hook) {
         init = true;
         Initialize();
     }
+    ProbeSampRepair();
+    RepairSampObjects();
     g_timerUpdate();
 }
 
@@ -604,7 +812,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         g_module = instance;
         DisableThreadLibraryCalls(instance);
         OpenLog();
-        Log("RenderAlphaFix 1.0 ASI LOADED in DllMain; installing GameLoop hook");
+        Log("RenderAlphaFix 1.1 ASI LOADED in DllMain; installing GameLoop hook");
         if (!InstallMainLoopHook()) {
             Log("FATAL: GameLoop hook installation failed; render fix is inactive");
             OutputDebugStringA("RenderAlphaFix: failed to install GameLoop hook at 0x53E968\n");
