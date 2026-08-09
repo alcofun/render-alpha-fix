@@ -83,6 +83,16 @@ R2 and R4 are expected to share the matched compiler/layout pattern, but have no
 
 Unknown GTA executables are not patched. An unknown or substantially modified `samp.dll` keeps renderer containment active but disables the optional object repair.
 
+### Verification status
+
+| Client | Signature discovery | Runtime initialization | Field result |
+|---|---|---|---|
+| SA-MP 0.3.7-R1 | Verified, one unique match per function | Verified | Normal rendering and self-tests pass |
+| SA-MP 0.3.7-R3 | Verified, one unique match per function | Verified | Reported render stutter is resolved; normal rendering and self-tests pass |
+| SA-MP 0.3.7-R2/R4 | Expected compatible | Not tested | Not tested |
+
+The captured R1/R3 sessions did not contain a live `REJECT` followed by `SA-MP OBJECT REPAIR rebuilt`, so signature installation and performance are field-verified while a naturally triggered object reconstruction remains subject to extended server testing.
+
 ## Installation
 
 1. Copy `RenderAlphaFix.asi` and `RenderAlphaFix.ini` next to `gta_sa.exe`.
