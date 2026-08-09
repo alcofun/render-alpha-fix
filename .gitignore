@@ -1,5 +1,6 @@
 /build/
 /build-tests/
+/build-*/
 /outputs/
 *.user
 *.suo

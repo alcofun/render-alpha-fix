@@ -1,137 +1,125 @@
 # RenderAlphaFix
 
-RenderAlphaFix is a focused x86 ASI plugin for GTA San Andreas 1.0 US. It prevents crashes in `CVisibilityPlugins::RenderAlphaAtomic` caused by corrupted RenderWare material lists and removes the function's original 152-material stack limit.
+RenderAlphaFix is a small x86 ASI plugin that repairs a malformed SA-MP server-object material state associated with crashes in GTA San Andreas RenderWare code.
 
-The plugin works at the GTA renderer level. It does not depend on a particular `samp.dll`, server protocol revision, or SAMP AddOn installation.
+The implementation is based on reverse engineering of the working object-repair path in SAMP AddOn. It deliberately operates at the SA-MP object layer and does not detour GTA's renderer.
 
 ## Background
 
-The original field report describes a custom SA-MP client with increased limits crashing at irregular intervals while server objects are enabled. The reported exception is:
+The original field report describes a custom SA-MP client crashing at irregular intervals while server objects are enabled. Reported locations include:
 
 ```text
-Unhandled exception at 0x007324B6 in gta_sa.exe (+0x3324B6)
-0xC0000005: Access violation reading location 0x00000008
-EAX: 0x00000001
+0x007324B6  CVisibilityPlugins::RenderAlphaAtomic
+0x0081214A  RpMatFXMaterialGetEffects
+0x00756B89  D3D9 geometry instancing
+0x00749EE4  RpAtomicClone
 ```
 
 See the [original report and discussion on BlastHack](https://www.blast.hk/threads/256784/#post-1689979).
 
-At `0x7324B6`, the game executes the equivalent of:
-
-```asm
-mov cl, byte ptr [eax+7]
-```
-
-`EAX` is expected to contain an `RpMaterial*`; offset `+7` is the material alpha byte. In the captured crash, the material-list entry contains `1`, so the game attempts to read address `0x00000008`.
-
-Reverse engineering also exposed a separate defect in the same function. The original implementation reserves `0x98` bytes on the stack to save material alpha values. That is exactly 152 entries. A geometry with 153 or more materials writes past the buffer and can overwrite the return address. Raising client limits makes this latent bug more relevant.
+The `0x7324B6` dump contains `RpMaterial*=1`, causing GTA to read address `0x00000008`. A later `0x749EE4` dump contains a geometry whose morph-target pointer is null. These are different downstream symptoms of an object resource that is no longer internally consistent.
 
 ## What the fix does
 
-RenderAlphaFix replaces the complete `CVisibilityPlugins::RenderAlphaAtomic` entry at `gta_sa.exe+0x332480` using [kthook](https://github.com/kin4stat/kthook).
+Analysis of SAMP AddOn found an upstream repair for server objects. It considers a material-text slot pending or malformed when all three conditions are true:
 
-Before rendering an alpha atomic, it validates:
+```text
+materialType[slot] == 2
+textureWasCreated[slot] == 0
+materialOrBackgroundPointer[slot] != nullptr
+```
 
-- the atomic and its geometry;
-- the material count and allocated material-list capacity;
-- the complete material pointer array;
-- every `RpMaterial` object and its writable alpha field.
+For such an object, AddOn invokes SA-MP's own `CObject::ConstructMaterialText`. RenderAlphaFix reproduces that operation without depending on AddOn.
 
-Validation is performed for the entire list before any alpha value is changed. If the list is inconsistent, the affected atomic is skipped for that frame. A damaged object may briefly disappear, but the invalid list is never passed into the RenderWare pipeline.
+At runtime the plugin:
 
-For valid lists, the plugin stores exact material pointers and alpha values in per-call storage, invokes GTA's original render callback, then restores values in reverse order. The first 512 entries use inline storage; larger lists use dynamically sized storage up to the configured safety limit. Restoration of material alpha and atomic flags is protected with structured exception handling.
+- locates `CObjectPool::Process` and `CObject::ConstructMaterialText` through long, unique executable signatures;
+- captures the active object pool from the real process call;
+- checks a small slice of the pool after each process call;
+- validates the game-entity pointer and all 16 material slots;
+- rebuilds at most one malformed object per process call;
+- applies a per-object retry cooldown;
+- disables repair safely if an unexpected access fault occurs.
 
-The normal render path uses guarded memory accesses instead of issuing `VirtualQuery` system calls for every material. Rejection logging is buffered and repeated reports are heavily throttled, keeping disk I/O out of the frame-critical path.
+No SA-MP RVA, PE entry point or version flag is used. The signatures were verified as unique in SA-MP 0.3.7-R1 and R3.
 
-On compatible SA-MP clients, a rejected material list schedules an event-driven object-pool repair. `CObjectPool::Process` and `CObject::ConstructMaterialText` are located through unique code signatures; no SA-MP RVA, PE entry point or global-address table is used. The repair reproduces the invariant used by SAMP AddOn: a material-text slot is malformed when its type is text, its texture-created flag is clear, and its material/background pointer is still populated. Up to five affected objects are rebuilt through SA-MP's own `CObject::ConstructMaterialText`; scanning is rate-limited and never runs during healthy rendering.
+## Render-path safety
 
-This upstream repair targets the shared damaged-resource state associated with failures reported at `0x7324B6` (`CVisibilityPlugins::RenderAlphaAtomic`), `0x81214A` (`RpMatFXMaterialGetEffects`) and `0x756B89` (`_rxD3D9Instance`). It also prevents malformed object resources from propagating into later hierarchy and skinned-frame updates reported at `0x7C5A8B` and `0x4D1996`. The separate `0x7F5A3A` dynamic-vertex-buffer failure is a video-memory exhaustion path and is not treated as the same defect.
+The preceding development approach intercepted every alpha atomic and guarded GTA resource construction. Those measures were intentionally removed: they operated too broadly inside performance-critical RenderWare paths, could interfere with world rendering on custom clients, and contained downstream symptoms instead of repairing the known source state.
 
-Additional safeguards include:
+The plugin does not execute validation, allocation, logging or detour bookkeeping inside `RenderAlphaAtomic`, `_RpAtomicClone` or another RenderWare hot path. Its only GTA patch is the game-loop initialization call-site; object repair runs from SA-MP's own object-pool process callback.
 
-- byte-signature checks before either game-code hook is installed;
-- one-time initialization from the GTA game loop, without a worker thread;
-- chaining when another ASI has already redirected the selected game-loop call;
-- module pinning to prevent unsafe hot-unload while hooks are active;
-- a startup self-test and an in-game hook-path self-test;
-- throttled diagnostics for rejected atomics.
+The replacement follows the known working AddOn strategy: repair the inconsistent SA-MP object before it reaches GTA's renderer. This minimizes compatibility risk with custom renderers and other ASI plugins.
 
 ## SAMP AddOn comparison
 
-SAMP AddOn is useful prior art and is reported to prevent this crash in supported installations. RenderAlphaFix has a different scope: it is a standalone last line of defence inside GTA's RenderWare path.
+The relevant AddOn object fix and RenderAlphaFix perform the same recovery action: identify the inconsistent material-text state and call `CObject::ConstructMaterialText`.
 
-| | RenderAlphaFix | SAMP AddOn approach |
-|---|---|---|
-| Deployment | One single-purpose ASI | Part of a broader client add-on |
-| SA-MP coupling | No `samp.dll` offsets or object layouts | Can depend on supported SA-MP/client layouts |
-| Protection point | RenderWare containment plus compatible SA-MP object repair | Can repair known object/material states earlier |
-| Raised material counts | Removes the original 152-entry stack overflow | Not the focus of the reported workaround |
-| Failure policy | Skips one unsafe atomic for the current frame | Upstream repair may preserve the object |
-| Diagnostics | Signature checks, self-tests, rejection log | Depends on the add-on build |
+A separate AddOn buffer initially believed to store object material text was verified to be a vehicle license-plate workaround. Its hooks target `CVehicle::SetLicensePlateText`, `CVehicle::ConstructLicensePlate` and `CVehiclePool`; it is unrelated to this object crash and is intentionally not copied.
 
-This does not make either design universally superior. Repairing bad SA-MP object state at its source can preserve more rendering information. RenderAlphaFix is preferable when SAMP AddOn is incompatible with a custom client, when a small auditable fix is required, or when corruption may originate outside a known SA-MP material-text path.
+RenderAlphaFix differs mainly in deployment and discovery:
+
+- it is a single-purpose ASI;
+- it finds R1/R3 functions by code signatures;
+- it scans incrementally instead of running a full pool pass;
+- it logs every actual reconstruction by default.
 
 ## Compatibility
 
-- GTA San Andreas 1.0 US (Hoodlum executable layout)
+- GTA San Andreas 1.0 US (Hoodlum executable layout for game-loop initialization)
 - 32-bit Windows process
-- any compatible x86 ASI loader
-- all SA-MP/custom clients that preserve the verified GTA code signatures for renderer containment
-- upstream repair signature-tested against SA-MP 0.3.7-R1 and 0.3.7-R3
+- compatible x86 ASI loader
+- SA-MP 0.3.7-R1 and R3 signatures verified
 
-R2 and R4 are expected to share the matched compiler/layout pattern, but have not been run in a real client. The repair is enabled only when both long signatures are unique in the loaded module; otherwise renderer containment stays active and the optional SA-MP repair is disabled.
-
-Unknown GTA executables are not patched. An unknown or substantially modified `samp.dll` keeps renderer containment active but disables the optional object repair.
-
-### Verification status
-
-| Client | Signature discovery | Runtime initialization | Field result |
-|---|---|---|---|
-| SA-MP 0.3.7-R1 | Verified, one unique match per function | Verified | Normal rendering and self-tests pass |
-| SA-MP 0.3.7-R3 | Verified, one unique match per function | Verified | Reported render stutter is resolved; normal rendering and self-tests pass |
-| SA-MP 0.3.7-R2/R4 | Expected compatible | Not tested | Not tested |
-
-The captured R1/R3 sessions did not contain a live `REJECT` followed by `SA-MP OBJECT REPAIR rebuilt`, so signature installation and performance are field-verified while a naturally triggered object reconstruction remains subject to extended server testing.
+R2 and R4 may share compatible compiler patterns, but have not been field-tested. If either signature is absent or ambiguous, the plugin logs the condition and makes no SA-MP patch.
 
 ## Installation
 
 1. Copy `RenderAlphaFix.asi` and `RenderAlphaFix.ini` next to `gta_sa.exe`.
-2. Start the game through the usual client or launcher.
-3. Open `RenderAlphaFix.log` in the game directory.
+2. Start the game and open `RenderAlphaFix.log`.
 
-A successful startup contains these milestones:
+A successful startup contains:
 
 ```text
+RenderAlphaFix 1.1 ASI LOADED
 GAMELOOP HOOK INSTALLED
-HOOK INSTALLED
-SYNTHETIC SELFTEST PASS
-IN-GAME SELFTEST PASS
+RenderAlphaFix 1.1 initializing from GTA GameLoop; mode=SA-MP object repair only
+SYNTHETIC SELFTEST PASS: SA-MP material-text invariant
+SA-MP OBJECT REPAIR enabled by signatures
 ```
 
-The in-game self-test passes a local invalid material pointer through the actual hook. It does not alter a live GTA material list and deliberately skips one atomic before normal rendering begins.
+When a real affected object is found:
+
+```text
+SA-MP OBJECT REPAIR rebuilt malformed object id=...
+```
+
+The absence of this line simply means that no matching object state has been observed yet.
 
 ## Configuration
 
 ```ini
-[Fix]
-MaxMaterials=4096
-LogRejected=1
+[Repair]
+ScanBudget=32
+RetryCooldownMs=10000
+LogRepairs=1
 ```
 
-`MaxMaterials` is an explicit upper bound for one geometry. Counts above it are rejected instead of allocating unbounded memory. `LogRejected=0` disables individual rejection messages while keeping the protection active.
+- `ScanBudget` controls how many object IDs are checked per pool-process call. Valid range: 1–256.
+- `RetryCooldownMs` prevents a persistently failing object from being rebuilt every frame. Valid range: 1000–60000.
+- `LogRepairs=0` suppresses individual reconstruction records without disabling repair.
+
+The defaults scan a full 1000-object pool over multiple frames and never rebuild more than one object in a single call.
 
 ## Verification
 
-For initial deployment, use a separate game copy and temporarily remove other anti-crash plugins so the result is attributable to this ASI.
+1. Confirm all startup milestones in the log.
+2. Check that normal world rendering and the HUD continue updating.
+3. Exercise object stream-in/out, moving objects, `SetObjectMaterial`, and `SetObjectMaterialText`.
+4. Run an extended session on the affected server.
+5. If a repair line appears, retain the complete log and confirm that the game continues normally afterward.
 
-1. Confirm all four startup milestones in `RenderAlphaFix.log`.
-2. Play normally for 15–30 minutes and check alpha-rendered objects, vehicles and peds.
-3. Exercise object stream-in/out, moving objects, editing objects, `SetObjectMaterial` and `SetObjectMaterialText`.
-4. Run an extended session on the affected server. Real corruptions appear as `REJECT` records and must not terminate the process.
-
-The repository also contains a mock GTA host used during development. It verifies game-loop chaining, hook installation, in-game self-test completion, valid alpha restoration, and rejection of the observed `RpMaterial*=1` case.
-
-The regression suite also covers the field-observed `0xC1000000` material value and the malformed SA-MP material-text slot invariant used to schedule object reconstruction.
+The standalone mock host verifies game-loop hook installation, chaining to the original timer update, and startup self-test execution. The self-test covers the exact three-field SA-MP invariant without changing live game or SA-MP memory.
 
 ## Building
 
@@ -146,7 +134,7 @@ cmake --build build --config Release
 
 The resulting plugin is `build/Release/RenderAlphaFix.asi`. The MSVC runtime is linked statically.
 
-To build the mock host as well:
+To build the mock host:
 
 ```bat
 cmake -S . -B build-tests -G "Visual Studio 18 2026" -A Win32 -DRENDER_ALPHA_FIX_BUILD_TESTS=ON
@@ -156,9 +144,9 @@ build-tests\Release\mock_host.exe build-tests\Release\RenderAlphaFix.asi
 
 ## Limitations
 
-Guarded reads and writes reject null, low and inaccessible pointers, but they cannot prove that an object in otherwise accessible memory is still logically alive. Renderer containment therefore remains a last line of defence. The optional SA-MP repair addresses the known malformed material-text state only on the explicitly supported object layout.
+The plugin targets the specific malformed material-text state demonstrated by SAMP AddOn. It does not suppress arbitrary GTA or RenderWare exceptions. A crash caused by unrelated model data, graphics drivers, video-memory exhaustion or another plugin remains outside its scope.
 
-Hot-unloading is not supported. The plugin is pinned until process exit. GTA's original RenderWare path is expected to execute on the game render thread; custom multithreaded renderers are outside the supported configuration.
+Hot-unloading is not supported. The module is pinned until process exit.
 
 ## License and third-party code
 
