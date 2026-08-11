@@ -15,7 +15,7 @@ The original field report describes a custom SA-MP client crashing at irregular 
 0x00749EE4  RpAtomicClone
 ```
 
-See the [original report and discussion on BlastHack](https://www.blast.hk/threads/256784/#post-1689979).
+See the [original report and discussion on BlastHack](https://www.blast.hk/threads/256784/).
 
 The `0x7324B6` dump contains `RpMaterial*=1`, causing GTA to read address `0x00000008`. A later `0x749EE4` dump contains a geometry whose morph-target pointer is null. These are different downstream symptoms of an object resource that is no longer internally consistent.
 
