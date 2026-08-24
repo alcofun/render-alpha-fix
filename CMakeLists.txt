@@ -26,11 +26,6 @@ set_target_properties(RenderAlphaFix PROPERTIES
     SUFFIX ".asi"
     OUTPUT_NAME "RenderAlphaFix")
 
-add_custom_command(TARGET RenderAlphaFix POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CMAKE_CURRENT_SOURCE_DIR}/RenderAlphaFix.ini"
-            "$<TARGET_FILE_DIR:RenderAlphaFix>/RenderAlphaFix.ini")
-
 option(RENDER_ALPHA_FIX_BUILD_TESTS "Build the standalone mock GTA host" OFF)
 if(RENDER_ALPHA_FIX_BUILD_TESTS)
     add_executable(RenderAlphaFixMock tests/mock_host.cpp)
