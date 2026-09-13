@@ -21,6 +21,10 @@ constexpr std::uintptr_t kMainLoopCallRva = 0x13E968;
 constexpr std::uintptr_t kTimerUpdateRva = 0x161B10;
 constexpr std::uintptr_t kRenderAlphaAtomicAddress = 0x732480;
 constexpr std::uintptr_t kAtomicDefaultRenderAddress = 0x7491C0;
+constexpr std::uintptr_t kAtomicSetGeometrySphereCopyAddress = 0x749D7B;
+constexpr std::uintptr_t kAtomicSetGeometryAfterSphereCopyAddress = 0x749D9A;
+constexpr std::uintptr_t kAtomicCloneSphereCopyAddress = 0x749EDB;
+constexpr std::uintptr_t kAtomicCloneAfterMorphSphereCopyAddress = 0x749EFA;
 constexpr std::uintptr_t kResetTagAlphaAddress = 0x49CD50;
 constexpr std::uintptr_t kGetTagAlphaAddress = 0x49CF90;
 constexpr std::uintptr_t kSetTagAlphaAddress = 0x49CEC0;
@@ -133,6 +137,8 @@ SRWLOCK g_logLock = SRWLOCK_INIT;
 MainLoopHook* g_mainLoopHook{};
 NakedHook* g_constructMaterialsHook{};
 NakedHook* g_shutdownMaterialsHook{};
+NakedHook* g_atomicSetGeometrySphereHook{};
+NakedHook* g_atomicCloneSphereHook{};
 SetMaterialHook* g_setMaterialHook{};
 SetMaterialTextHook* g_setMaterialTextHook{};
 RenderAlphaAtomicHook* g_renderAlphaAtomicHook{};
@@ -167,6 +173,8 @@ std::int32_t g_loggedInvalidAtomicCount{};
 SRWLOCK g_invalidAtomicLogLock = SRWLOCK_INIT;
 void* g_loggedInvalidTags[64]{};
 std::int32_t g_loggedInvalidTagCount{};
+volatile LONG g_atomicCloneSphereRejects{};
+volatile LONG g_atomicSetGeometrySphereRejects{};
 
 template <typename HookType>
 struct HookReturnGuard {
@@ -221,6 +229,9 @@ bool IsValidMaterialIndex(int index) noexcept;
 bool IsBoundedString(const char* value, std::size_t maximumLength) noexcept;
 bool IsValidMaterialSize(std::uint8_t size) noexcept;
 bool ValidateAtomic(const void* atomic, const char** reason) noexcept;
+bool ValidateFirstMorphSphereForUse(const void* geometry, const char** reason,
+                                    std::int32_t* count,
+                                    const void** morphTarget) noexcept;
 bool SafeRenderAlphaAtomic(void* atomic, int drawAlpha,
                            AlphaReject* reject) noexcept;
 bool ValidateObjectMaterialState(void* object, const char** reason,
@@ -367,13 +378,25 @@ bool SyntheticTests() noexcept {
     std::fill(std::begin(materials), std::end(materials),
               static_cast<void*>(material));
     atomic[0] = 1;
+    geometry[0] = 8;
     *reinterpret_cast<void**>(atomic + 0x18) = geometry;
+    *reinterpret_cast<std::int32_t*>(geometry + 0x18) = 1;
     *reinterpret_cast<void**>(geometry + 0x5C) = morphTarget;
+    *reinterpret_cast<void**>(morphTarget) = geometry;
     *reinterpret_cast<void***>(geometry + 0x20) = materials;
     *reinterpret_cast<std::int32_t*>(geometry + 0x24) = 1;
     *reinterpret_cast<std::int32_t*>(geometry + 0x28) = 153;
     const char* rwReason{};
     const bool validAtomicAccepted = ValidateAtomic(atomic, &rwReason);
+    *reinterpret_cast<void**>(geometry + 0x5C) = nullptr;
+    const bool missingMorphRejected = !ValidateAtomic(atomic, &rwReason);
+    *reinterpret_cast<void**>(geometry + 0x5C) = morphTarget;
+    *reinterpret_cast<std::int32_t*>(geometry + 0x18) = 0;
+    const bool zeroMorphCountRejected = !ValidateAtomic(atomic, &rwReason);
+    *reinterpret_cast<std::int32_t*>(geometry + 0x18) = 1;
+    geometry[0] = 0;
+    const bool invalidGeometryTypeRejected = !ValidateAtomic(atomic, &rwReason);
+    geometry[0] = 8;
     *reinterpret_cast<std::int32_t*>(geometry + 0x24) = 153;
     const bool materialOverflowRejected = !ValidateAtomic(atomic, &rwReason);
     *reinterpret_cast<std::int32_t*>(geometry + 0x24) = 1;
@@ -404,11 +427,14 @@ bool SyntheticTests() noexcept {
     const bool passed = malformedDetected && healthyIgnored && emptyIgnored &&
                         layouts && indexBounds && invalidGraphRejected &&
                         payloadBounds && validAtomicAccepted &&
+                        missingMorphRejected && zeroMorphCountRejected &&
+                        invalidGeometryTypeRejected &&
                         materialOverflowRejected && guardedRenderAccepted &&
                         guardedInvalidRejected && tagInvariant;
     Log("SYNTHETIC SELFTEST %s: SA-MP material-text invariant; "
         "full payload/slot graph; material indices 0..15; "
-        "RenderWare material limit 152; zero-allocation alpha guard; "
+        "RenderWare material limit 152; first morph-target sphere invariant; "
+        "zero-allocation alpha guard; "
         "tag descriptor invariant; pool layouts 1000/2100",
         passed ? "PASS" : "FAIL");
     return passed;
@@ -645,6 +671,45 @@ bool IsValidComObject(const void* object) noexcept {
     return CheckRange(vtable, 3 * sizeof(void*));
 }
 
+bool ValidateFirstMorphSphereForUse(const void* geometry, const char** reason,
+                                    std::int32_t* count,
+                                    const void** morphTarget) noexcept {
+    if (count) *count = -1;
+    if (morphTarget) *morphTarget = nullptr;
+    if (!CheckRange(geometry, 0x60)) {
+        *reason = "missing or unreadable RpGeometry";
+        return false;
+    }
+
+    __try {
+        const auto* bytes = static_cast<const std::uint8_t*>(geometry);
+        if (bytes[0] != 8) {
+            *reason = "invalid RpGeometry type";
+            return false;
+        }
+        const auto morphCount = *reinterpret_cast<const std::int32_t*>(
+            bytes + 0x18);
+        const auto* firstMorph = *reinterpret_cast<std::uint8_t* const*>(
+            bytes + 0x5C);
+        if (count) *count = morphCount;
+        if (morphTarget) *morphTarget = firstMorph;
+        if (morphCount <= 0) {
+            *reason = "invalid RpMorphTarget count";
+            return false;
+        }
+        const auto morphAddress = reinterpret_cast<std::uintptr_t>(firstMorph);
+        if (!firstMorph || morphAddress > UINTPTR_MAX - 4 ||
+            !CheckRange(reinterpret_cast<const void*>(morphAddress + 4), 16)) {
+            *reason = "missing or unreadable first RpMorphTarget sphere";
+            return false;
+        }
+        return true;
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+        *reason = "RpMorphTarget access fault";
+        return false;
+    }
+}
+
 bool ValidateAtomic(const void* atomic, const char** reason) noexcept {
     if (!CheckRange(atomic, 0x1C)) {
         *reason = "unreadable RpAtomic";
@@ -658,16 +723,8 @@ bool ValidateAtomic(const void* atomic, const char** reason) noexcept {
             return false;
         }
         const auto* geometry = *reinterpret_cast<std::uint8_t* const*>(bytes + 0x18);
-        if (!CheckRange(geometry, 0x60)) {
-            *reason = "missing or unreadable RpGeometry";
+        if (!ValidateFirstMorphSphereForUse(geometry, reason, nullptr, nullptr))
             return false;
-        }
-        const auto* morphTarget = *reinterpret_cast<std::uint8_t* const*>(
-            geometry + 0x5C);
-        if (!CheckRange(morphTarget ? morphTarget + 4 : nullptr, 16)) {
-            *reason = "missing RpMorphTarget";
-            return false;
-        }
 
         auto* materials = *reinterpret_cast<void* const* const*>(geometry + 0x20);
         const auto count = *reinterpret_cast<const std::int32_t*>(geometry + 0x24);
@@ -1475,7 +1532,7 @@ bool ObjectOwnsAtomic(void* object, void* atomic) noexcept {
 }
 
 bool QueueAtomicOwner(void* atomic, std::int32_t materialIndex,
-                      const char* reason) noexcept {
+                      const char* operation, const char* reason) noexcept {
     auto* pool = g_lastObjectPool;
     if (!pool || g_poolLayout.capacity <= 0) return false;
     auto largest = g_lastLargestObjectId;
@@ -1486,10 +1543,117 @@ bool QueueAtomicOwner(void* atomic, std::int32_t materialIndex,
         void* object{};
         if (!ReadPoolObject(pool, id, &object)) return false;
         if (!object || !ObjectOwnsAtomic(object, atomic)) continue;
-        QueueQuarantine(object, materialIndex, "RenderAlphaAtomic", reason);
+        QueueQuarantine(object, materialIndex, operation, reason);
         return true;
     }
     return false;
+}
+
+bool ShouldLogSphereReject(volatile LONG* counter, LONG* observed) noexcept {
+    const LONG value = InterlockedIncrement(counter);
+    if (observed) *observed = value;
+    return value <= 20 || value % 1000 == 0;
+}
+
+void AtomicCloneSphereGuard(const NakedHook& hook) noexcept {
+    const auto& context = hook.get_context();
+    auto* geometry = reinterpret_cast<void*>(context.esi);
+    const char* reason{};
+    std::int32_t morphCount{-1};
+    const void* morphTarget{};
+    if (ValidateFirstMorphSphereForUse(geometry, &reason, &morphCount,
+                                      &morphTarget)) return;
+
+    LONG rejected{};
+    if (ShouldLogSphereReject(&g_atomicCloneSphereRejects, &rejected)) {
+        Log("RW SPHERE GUARD skipped operation=RpAtomicClone "
+            "sourceAtomic=%p cloneAtomic=%p geometry=%p morphCount=%ld "
+            "morphTarget=%p reason=%s rejected=%ld",
+            reinterpret_cast<void*>(context.ebp),
+            reinterpret_cast<void*>(context.ebx), geometry,
+            static_cast<long>(morphCount), morphTarget,
+            reason ? reason : "invalid RpMorphTarget",
+            static_cast<long>(rejected));
+    }
+
+    // The skipped sphere is only an intermediate value. Continue through the
+    // stock frame-update block; RpAtomicClone then copies the source atomic's
+    // bounding sphere over this destination unconditionally at 0x749F17.
+    hook.get_return_address() = kAtomicCloneAfterMorphSphereCopyAddress;
+}
+
+void AtomicSetGeometrySphereGuard(const NakedHook& hook) noexcept {
+    const auto& context = hook.get_context();
+    auto* atomic = reinterpret_cast<void*>(context.esi);
+    auto* geometry = reinterpret_cast<void*>(context.edi);
+    const char* reason{};
+    std::int32_t morphCount{-1};
+    const void* morphTarget{};
+    if (ValidateFirstMorphSphereForUse(geometry, &reason, &morphCount,
+                                      &morphTarget)) return;
+
+    const bool ownerQueued = QueueAtomicOwner(
+        atomic, -1, "RpAtomicSetGeometry",
+        reason ? reason : "invalid RpMorphTarget");
+    LONG rejected{};
+    if (ShouldLogSphereReject(&g_atomicSetGeometrySphereRejects, &rejected)) {
+        Log("RW SPHERE GUARD skipped operation=RpAtomicSetGeometry "
+            "atomic=%p geometry=%p morphCount=%ld morphTarget=%p reason=%s "
+            "sampOwnerQueued=%d rejected=%ld",
+            atomic, geometry, static_cast<long>(morphCount), morphTarget,
+            reason ? reason : "invalid RpMorphTarget", ownerQueued ? 1 : 0,
+            static_cast<long>(rejected));
+    }
+
+    // Geometry ownership/refcounts were already committed. Preserve the
+    // atomic's previous sphere and continue with the normal frame update.
+    hook.get_return_address() = kAtomicSetGeometryAfterSphereCopyAddress;
+}
+
+bool InstallGeometrySphereGuards() noexcept {
+    auto* setGeometrySite = reinterpret_cast<std::uint8_t*>(
+        kAtomicSetGeometrySphereCopyAddress);
+    auto* cloneSite = reinterpret_cast<std::uint8_t*>(
+        kAtomicCloneSphereCopyAddress);
+    constexpr const char* setGeometrySignature =
+        "8B 47 5C 8D 4E 1C 83 C0 04 8B 10 89 11";
+    constexpr const char* cloneSignature =
+        "8B 56 5C 8D 43 1C 83 C2 04 8B 0A 89 08";
+
+    bool setGeometryInstalled{};
+    bool cloneInstalled{};
+    if (MatchesExecutablePatternAt(setGeometrySite, setGeometrySignature)) {
+        g_atomicSetGeometrySphereHook = new (std::nothrow) NakedHook(
+            setGeometrySite, &AtomicSetGeometrySphereGuard, false);
+        setGeometryInstalled = g_atomicSetGeometrySphereHook &&
+                               g_atomicSetGeometrySphereHook->install();
+        if (!setGeometryInstalled) {
+            delete g_atomicSetGeometrySphereHook;
+            g_atomicSetGeometrySphereHook = nullptr;
+        }
+    }
+    if (MatchesExecutablePatternAt(cloneSite, cloneSignature)) {
+        g_atomicCloneSphereHook = new (std::nothrow) NakedHook(
+            cloneSite, &AtomicCloneSphereGuard, false);
+        cloneInstalled = g_atomicCloneSphereHook &&
+                         g_atomicCloneSphereHook->install();
+        if (!cloneInstalled) {
+            delete g_atomicCloneSphereHook;
+            g_atomicCloneSphereHook = nullptr;
+        }
+    }
+
+    if (!setGeometryInstalled || !cloneInstalled) {
+        Log("RW SPHERE GUARD partial: RpAtomicSetGeometry=%s RpAtomicClone=%s; "
+            "missing site is unreadable, already detoured, or hook failed",
+            setGeometryInstalled ? "enabled" : "disabled",
+            cloneInstalled ? "enabled" : "disabled");
+    } else {
+        Log("RW SPHERE GUARD enabled: RpAtomicSetGeometry=%p RpAtomicClone=%p; "
+            "mode=preserve-nonnull-result use-site invariant",
+            setGeometrySite, cloneSite);
+    }
+    return setGeometryInstalled && cloneInstalled;
 }
 
 bool ShouldLogInvalidAtomic(void* atomic) noexcept {
@@ -1601,7 +1765,7 @@ void RenderAlphaAtomicReplacement(const RenderAlphaAtomicHook& hook,
     if (SafeRenderAlphaAtomic(atomic, drawAlpha, &reject)) return;
 
     const bool ownerQueued = QueueAtomicOwner(
-        atomic, reject.materialIndex,
+        atomic, reject.materialIndex, "RenderAlphaAtomic",
         reject.reason ? reject.reason : "invalid alpha atomic");
     if (ShouldLogInvalidAtomic(atomic)) {
         Log("RENDER ALPHA GUARD skipped atomic=%p geometry=%p "
@@ -1824,9 +1988,10 @@ void OpenLog() {
 }
 
 void Initialize() {
-    Log("RenderAlphaFix 1.1 initializing from GTA GameLoop; "
+    Log("RenderAlphaFix 1.2 initializing from GTA GameLoop; "
         "mode=SA-MP object repair + invalid-object quarantine + "
-        "zero-allocation alpha guard + narrow tag invariant guards");
+        "RenderWare use-site guards + zero-allocation alpha guard + "
+        "narrow tag invariant guards");
 
     HMODULE pinnedModule{};
     if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
@@ -1837,6 +2002,7 @@ void Initialize() {
     }
 
     InstallRenderAlphaGuard();
+    InstallGeometrySphereGuards();
     InstallTagInvariantGuards();
     SyntheticTests();
     SchedulingSelfTest();
@@ -1895,7 +2061,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         g_module = instance;
         DisableThreadLibraryCalls(instance);
         OpenLog();
-        Log("RenderAlphaFix 1.1 ASI LOADED in DllMain; installing GameLoop hook");
+        Log("RenderAlphaFix 1.2 ASI LOADED in DllMain; installing GameLoop hook");
         if (!InstallMainLoopHook()) {
             Log("FATAL: GameLoop hook installation failed; SA-MP repair is inactive");
             OutputDebugStringA("RenderAlphaFix: failed to install GameLoop hook at 0x53E968\n");

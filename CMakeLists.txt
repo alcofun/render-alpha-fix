@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RenderAlphaFix VERSION 1.1.0 LANGUAGES C CXX)
+project(RenderAlphaFix VERSION 1.2.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "RenderAlphaFix must be built as a 32-bit Windows DLL")
@@ -28,10 +28,15 @@ set_target_properties(RenderAlphaFix PROPERTIES
 
 option(RENDER_ALPHA_FIX_BUILD_TESTS "Build the standalone mock GTA host" OFF)
 if(RENDER_ALPHA_FIX_BUILD_TESTS)
+    include(CTest)
     add_executable(RenderAlphaFixMock tests/mock_host.cpp)
     target_compile_options(RenderAlphaFixMock PRIVATE /W4 /permissive- /EHsc)
     target_link_options(RenderAlphaFixMock PRIVATE
         /MACHINE:X86 /SUBSYSTEM:CONSOLE /BASE:0x00400000 /FIXED
         /DYNAMICBASE:NO /SECTION:.mock,RWE)
     set_target_properties(RenderAlphaFixMock PROPERTIES OUTPUT_NAME "mock_host")
+    add_test(NAME RenderAlphaFixMock
+        COMMAND RenderAlphaFixMock $<TARGET_FILE:RenderAlphaFix>)
+    set_tests_properties(RenderAlphaFixMock PROPERTIES
+        WORKING_DIRECTORY $<TARGET_FILE_DIR:RenderAlphaFixMock>)
 endif()
