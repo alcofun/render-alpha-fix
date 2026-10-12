@@ -25,6 +25,10 @@ constexpr std::uintptr_t kAtomicSetGeometrySphereCopyAddress = 0x749D7B;
 constexpr std::uintptr_t kAtomicSetGeometryAfterSphereCopyAddress = 0x749D9A;
 constexpr std::uintptr_t kAtomicCloneSphereCopyAddress = 0x749EDB;
 constexpr std::uintptr_t kAtomicCloneAfterMorphSphereCopyAddress = 0x749EFA;
+constexpr std::uintptr_t kGeometryDestroyAddress = 0x74CCC0;
+constexpr std::uintptr_t kMaterialDestroyAddress = 0x74DA20;
+constexpr std::uintptr_t kMaterialListDeinitializeAddress = 0x74E150;
+constexpr std::uintptr_t kTextureDestroyAddress = 0x7F3820;
 constexpr std::uintptr_t kResetTagAlphaAddress = 0x49CD50;
 constexpr std::uintptr_t kGetTagAlphaAddress = 0x49CF90;
 constexpr std::uintptr_t kSetTagAlphaAddress = 0x49CEC0;
@@ -75,6 +79,10 @@ using GetTagAlphaFn = std::uint8_t(__cdecl*)(void*);
 using SetTagAlphaFn = void(__cdecl*)(void*, std::uint8_t);
 using SetAtomicUserValueFn = void(__cdecl*)(void*, int);
 using AtomicDefaultRenderFn = void*(__cdecl*)(void*);
+using GeometryDestroyFn = int(__cdecl*)(void*);
+using MaterialDestroyFn = int(__cdecl*)(void*);
+using MaterialListDeinitializeFn = void*(__cdecl*)(void*);
+using TextureDestroyFn = int(__cdecl*)(void*);
 using dMainLoop = void(__stdcall*)();
 using MainLoopHook = kthook::kthook_simple<dMainLoop>;
 using SetMaterialHook = kthook::kthook_simple<SetMaterialFn>;
@@ -83,6 +91,11 @@ using RenderAlphaAtomicHook = kthook::kthook_simple<RenderAlphaAtomicFn>;
 using ResetTagAlphaHook = kthook::kthook_simple<ResetTagAlphaFn>;
 using GetTagAlphaHook = kthook::kthook_simple<GetTagAlphaFn>;
 using SetTagAlphaHook = kthook::kthook_simple<SetTagAlphaFn>;
+using GeometryDestroyHook = kthook::kthook_simple<GeometryDestroyFn>;
+using MaterialDestroyHook = kthook::kthook_simple<MaterialDestroyFn>;
+using MaterialListDeinitializeHook =
+    kthook::kthook_simple<MaterialListDeinitializeFn>;
+using TextureDestroyHook = kthook::kthook_simple<TextureDestroyFn>;
 using NakedHook = kthook::kthook_naked;
 
 struct PoolLayout {
@@ -145,6 +158,10 @@ RenderAlphaAtomicHook* g_renderAlphaAtomicHook{};
 ResetTagAlphaHook* g_resetTagAlphaHook{};
 GetTagAlphaHook* g_getTagAlphaHook{};
 SetTagAlphaHook* g_setTagAlphaHook{};
+GeometryDestroyHook* g_geometryDestroyHook{};
+MaterialDestroyHook* g_materialDestroyHook{};
+MaterialListDeinitializeHook* g_materialListDeinitializeHook{};
+TextureDestroyHook* g_textureDestroyHook{};
 dMainLoop g_timerUpdate{};
 std::uint8_t* g_sampBase{};
 ConstructMaterialTextFn g_constructMaterialText{};
@@ -175,6 +192,7 @@ void* g_loggedInvalidTags[64]{};
 std::int32_t g_loggedInvalidTagCount{};
 volatile LONG g_atomicCloneSphereRejects{};
 volatile LONG g_atomicSetGeometrySphereRejects{};
+volatile LONG g_destructionRejects{};
 
 template <typename HookType>
 struct HookReturnGuard {
@@ -225,6 +243,11 @@ int MemoryAccessFilter(DWORD code) noexcept {
 }
 
 bool CheckRange(const void* pointer, std::size_t size) noexcept;
+bool CheckWritableRange(void* pointer, std::size_t size) noexcept;
+bool ValidateGeometryForDestroy(void* geometry, const char** reason) noexcept;
+bool ValidateMaterialForDestroy(void* material, const char** reason) noexcept;
+bool ValidateMaterialListForDestroy(void* list, const char** reason) noexcept;
+bool ValidateTextureForDestroy(void* texture, const char** reason) noexcept;
 bool IsValidMaterialIndex(int index) noexcept;
 bool IsBoundedString(const char* value, std::size_t maximumLength) noexcept;
 bool IsValidMaterialSize(std::uint8_t size) noexcept;
@@ -424,18 +447,45 @@ bool SyntheticTests() noexcept {
         !ContainsTagDescriptor(object, tagDescriptors, 2) &&
         !ContainsTagDescriptor(gameEntity, tagDescriptors,
                                kMaximumTagCount + 1);
+    alignas(4) std::uint8_t destroyMaterial[0x1C]{};
+    *reinterpret_cast<std::int16_t*>(destroyMaterial + 0x18) = 2;
+    const bool sharedMaterialAccepted =
+        ValidateMaterialForDestroy(destroyMaterial, &rwReason);
+    *reinterpret_cast<std::int16_t*>(destroyMaterial + 0x18) = 0;
+    const bool zeroMaterialRefRejected =
+        !ValidateMaterialForDestroy(destroyMaterial, &rwReason);
+    alignas(4) std::uint8_t destroyList[12]{};
+    void* destroyMaterials[2]{destroyMaterial, nullptr};
+    *reinterpret_cast<void***>(destroyList) = destroyMaterials;
+    *reinterpret_cast<std::int32_t*>(destroyList + 4) = 2;
+    *reinterpret_cast<std::int32_t*>(destroyList + 8) = 2;
+    const bool mixedDestroyListAccepted =
+        ValidateMaterialListForDestroy(destroyList, &rwReason);
+    *reinterpret_cast<std::int32_t*>(destroyList + 4) = 3;
+    const bool corruptDestroyListRejected =
+        !ValidateMaterialListForDestroy(destroyList, &rwReason);
+    alignas(4) std::uint8_t destroyGeometry[0x60]{};
+    destroyGeometry[0] = 8;
+    *reinterpret_cast<std::int16_t*>(destroyGeometry + 0xE) = 1;
+    const bool nullMorphDestroyAccepted =
+        ValidateGeometryForDestroy(destroyGeometry, &rwReason);
     const bool passed = malformedDetected && healthyIgnored && emptyIgnored &&
                         layouts && indexBounds && invalidGraphRejected &&
                         payloadBounds && validAtomicAccepted &&
                         missingMorphRejected && zeroMorphCountRejected &&
                         invalidGeometryTypeRejected &&
                         materialOverflowRejected && guardedRenderAccepted &&
-                        guardedInvalidRejected && tagInvariant;
+                        guardedInvalidRejected && tagInvariant &&
+                        sharedMaterialAccepted && zeroMaterialRefRejected &&
+                        mixedDestroyListAccepted &&
+                        corruptDestroyListRejected &&
+                        nullMorphDestroyAccepted;
     Log("SYNTHETIC SELFTEST %s: SA-MP material-text invariant; "
         "full payload/slot graph; material indices 0..15; "
         "RenderWare material limit 152; first morph-target sphere invariant; "
         "zero-allocation alpha guard; "
-        "tag descriptor invariant; pool layouts 1000/2100",
+        "tag descriptor invariant; destruction refcounts/list bounds; "
+        "null morph teardown; pool layouts 1000/2100",
         passed ? "PASS" : "FAIL");
     return passed;
 }
@@ -495,6 +545,29 @@ bool ProtectionReadable(DWORD protect) noexcept {
            protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
 }
 
+bool ProtectionWritable(DWORD protect) noexcept {
+    protect &= 0xFF;
+    return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool ProtectionExecutable(DWORD protect) noexcept {
+    protect &= 0xFF;
+    return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool CheckExecutableAddress(const void* pointer) noexcept {
+    if (reinterpret_cast<std::uintptr_t>(pointer) < 0x10000) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQuery(pointer, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+        mbi.State == MEM_COMMIT &&
+        !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+        ProtectionExecutable(mbi.Protect);
+}
+
 bool CheckRange(const void* pointer, std::size_t size) noexcept {
     const auto start = reinterpret_cast<std::uintptr_t>(pointer);
     if (start < 0x10000 || size == 0 || start > UINTPTR_MAX - size) return false;
@@ -513,6 +586,194 @@ bool CheckRange(const void* pointer, std::size_t size) noexcept {
         cursor = regionEnd < end ? regionEnd : end;
     }
     return true;
+}
+
+bool CheckWritableRange(void* pointer, std::size_t size) noexcept {
+    const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+    if (start < 0x10000 || size == 0 || start > UINTPTR_MAX - size) return false;
+    const auto end = start + size;
+    auto cursor = start;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &mbi, sizeof(mbi)) !=
+            sizeof(mbi)) return false;
+        if (mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+            !ProtectionWritable(mbi.Protect)) return false;
+        const auto regionStart = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress);
+        if (regionStart > UINTPTR_MAX - mbi.RegionSize) return false;
+        const auto regionEnd = regionStart + mbi.RegionSize;
+        if (regionEnd <= cursor) return false;
+        cursor = regionEnd < end ? regionEnd : end;
+    }
+    return true;
+}
+
+bool ValidateTextureForDestroy(void* texture, const char** reason) noexcept {
+    if (!CheckWritableRange(texture, 0x58)) {
+        if (reason) *reason = "texture is null, unreadable or not writable";
+        return false;
+    }
+    __try {
+        auto* bytes = static_cast<std::uint8_t*>(texture);
+        const auto references = *reinterpret_cast<std::int32_t*>(bytes + 0x54);
+        if (references <= 0) {
+            if (reason) *reason = "texture refcount is not positive";
+            return false;
+        }
+        if (references > 1) return true;
+
+        void* dictionary = *reinterpret_cast<void**>(bytes + 4);
+        if (dictionary) {
+            auto* next = *reinterpret_cast<std::uint8_t**>(bytes + 8);
+            auto* previous = *reinterpret_cast<std::uint8_t**>(bytes + 0xC);
+            auto* link = bytes + 8;
+            if (!CheckWritableRange(next, 8) ||
+                !CheckWritableRange(previous, 8) ||
+                *reinterpret_cast<void**>(next + 4) != link ||
+                *reinterpret_cast<void**>(previous) != link) {
+                if (reason) *reason = "texture dictionary links are invalid";
+                return false;
+            }
+        }
+        void* raster = *reinterpret_cast<void**>(bytes);
+        if (raster && !CheckWritableRange(raster, 0x34)) {
+            if (reason) *reason = "texture raster is unreadable or not writable";
+            return false;
+        }
+        return true;
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+        if (reason) *reason = "texture validation fault";
+        return false;
+    }
+}
+
+bool ValidateMaterialForDestroy(void* material, const char** reason) noexcept {
+    if (!CheckWritableRange(material, 0x1C)) {
+        if (reason) *reason = "material is null, unreadable or not writable";
+        return false;
+    }
+    __try {
+        auto* bytes = static_cast<std::uint8_t*>(material);
+        const auto references = *reinterpret_cast<std::int16_t*>(bytes + 0x18);
+        if (references <= 0) {
+            if (reason) *reason = "material refcount is not positive";
+            return false;
+        }
+        if (references == 1) {
+            void* texture = *reinterpret_cast<void**>(bytes);
+            if (texture && !ValidateTextureForDestroy(texture, reason))
+                return false;
+        }
+        return true;
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+        if (reason) *reason = "material validation fault";
+        return false;
+    }
+}
+
+bool ValidateMaterialListForDestroy(void* list, const char** reason) noexcept {
+    if (!CheckWritableRange(list, 12)) {
+        if (reason) *reason = "material list header is unreadable or not writable";
+        return false;
+    }
+    __try {
+        auto* bytes = static_cast<std::uint8_t*>(list);
+        auto** materials = *reinterpret_cast<void***>(bytes);
+        const auto count = *reinterpret_cast<std::int32_t*>(bytes + 4);
+        const auto capacity = *reinterpret_cast<std::int32_t*>(bytes + 8);
+        if (count < 0 || capacity < 0 || count > capacity ||
+            capacity > kMaximumGeometryMaterialCapacity) {
+            if (reason) *reason = "material list count/capacity is invalid";
+            return false;
+        }
+        if (!materials) {
+            if (count != 0 || capacity != 0) {
+                if (reason) *reason = "material list has no storage";
+                return false;
+            }
+            return true;
+        }
+        if (capacity == 0 ||
+            !CheckWritableRange(materials,
+                static_cast<std::size_t>(capacity) * sizeof(void*))) {
+            if (reason) *reason = "material list storage is invalid";
+            return false;
+        }
+        return true;
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+        if (reason) *reason = "material list validation fault";
+        return false;
+    }
+}
+
+bool ValidateGeometryForDestroy(void* geometry, const char** reason) noexcept {
+    if (!CheckWritableRange(geometry, 0x60)) {
+        if (reason) *reason = "geometry is null, unreadable or not writable";
+        return false;
+    }
+    __try {
+        auto* bytes = static_cast<std::uint8_t*>(geometry);
+        if (bytes[0] != 8) {
+            if (reason) *reason = "geometry object type is invalid";
+            return false;
+        }
+        const auto references = *reinterpret_cast<std::int16_t*>(bytes + 0xE);
+        if (references <= 0) {
+            if (reason) *reason = "geometry refcount is not positive";
+            return false;
+        }
+        if (references > 1) return true;
+
+        if (!ValidateMaterialListForDestroy(bytes + 0x20, reason))
+            return false;
+        struct OwnedRange { std::size_t offset; std::size_t size; };
+        constexpr OwnedRange ownedRanges[] = {
+            {0x54, 0x10}, // RpMeshHeader
+            {0x5C, 0x1C}, // first RpMorphTarget; null is valid in teardown
+        };
+        for (const auto& range : ownedRanges) {
+            void* owned = *reinterpret_cast<void**>(bytes + range.offset);
+            if (owned && !CheckWritableRange(owned, range.size)) {
+                if (reason) *reason = "geometry owned resource is invalid";
+                return false;
+            }
+        }
+        auto* resource = *reinterpret_cast<std::uint8_t**>(bytes + 0x58);
+        if (resource) {
+            if (!CheckWritableRange(resource, 0x18)) {
+                if (reason) *reason = "geometry resource entry is invalid";
+                return false;
+            }
+            auto* next = *reinterpret_cast<std::uint8_t**>(resource);
+            auto* previous = *reinterpret_cast<std::uint8_t**>(resource + 4);
+            if (next &&
+                (!CheckWritableRange(next, 8) ||
+                 !CheckWritableRange(previous, 8) ||
+                 *reinterpret_cast<void**>(next + 4) != resource ||
+                 *reinterpret_cast<void**>(previous) != resource)) {
+                if (reason) *reason = "geometry resource links are invalid";
+                return false;
+            }
+            auto** ownerReference =
+                *reinterpret_cast<void***>(resource + 0x10);
+            if (ownerReference &&
+                (!CheckWritableRange(ownerReference, sizeof(void*)) ||
+                 *ownerReference != resource)) {
+                if (reason) *reason = "geometry resource owner link is invalid";
+                return false;
+            }
+            void* destroyNotify = *reinterpret_cast<void**>(resource + 0x14);
+            if (destroyNotify && !CheckExecutableAddress(destroyNotify)) {
+                if (reason) *reason = "geometry resource callback is invalid";
+                return false;
+            }
+        }
+        return true;
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+        if (reason) *reason = "geometry validation fault";
+        return false;
+    }
 }
 
 std::uint8_t* FindUniqueExecutablePattern(std::uint8_t* module,
@@ -1777,6 +2038,122 @@ void RenderAlphaAtomicReplacement(const RenderAlphaAtomicHook& hook,
     }
 }
 
+void LogDestructionReject(const char* operation, void* object,
+                          const char* reason) noexcept {
+    if (InterlockedIncrement(&g_destructionRejects) > 64) return;
+    Log("RW DESTRUCTION GUARD skipped operation=%s object=%p reason=%s",
+        operation, object, reason ? reason : "unknown");
+}
+
+int GeometryDestroyReplacement(const GeometryDestroyHook& hook,
+                               void*& geometry) {
+    HookReturnGuard<GeometryDestroyHook> returnGuard(hook);
+    const char* reason{};
+    if (ValidateGeometryForDestroy(geometry, &reason))
+        return hook.get_trampoline()(geometry);
+    LogDestructionReject("RpGeometryDestroy", geometry, reason);
+    return 1;
+}
+
+int MaterialDestroyReplacement(const MaterialDestroyHook& hook,
+                               void*& material) {
+    HookReturnGuard<MaterialDestroyHook> returnGuard(hook);
+    const char* reason{};
+    if (ValidateMaterialForDestroy(material, &reason))
+        return hook.get_trampoline()(material);
+    LogDestructionReject("RpMaterialDestroy", material, reason);
+    return 1;
+}
+
+void SafeZeroMaterialList(void* list) noexcept {
+    if (!CheckWritableRange(list, 12)) return;
+    __try {
+        std::memset(list, 0, 12);
+    } __except (MemoryAccessFilter(GetExceptionCode())) {
+    }
+}
+
+void* MaterialListDeinitializeReplacement(
+    const MaterialListDeinitializeHook& hook, void*& list) {
+    HookReturnGuard<MaterialListDeinitializeHook> returnGuard(hook);
+    const char* reason{};
+    if (ValidateMaterialListForDestroy(list, &reason))
+        return hook.get_trampoline()(list);
+
+    LogDestructionReject("_rpMaterialListDeinitialize", list, reason);
+    SafeZeroMaterialList(list);
+    return list;
+}
+
+int TextureDestroyReplacement(const TextureDestroyHook& hook,
+                              void*& texture) {
+    HookReturnGuard<TextureDestroyHook> returnGuard(hook);
+    const char* reason{};
+    if (ValidateTextureForDestroy(texture, &reason))
+        return hook.get_trampoline()(texture);
+    LogDestructionReject("RwTextureDestroy", texture, reason);
+    return 1;
+}
+
+bool InstallDestructionGuards() noexcept {
+    auto* geometry = reinterpret_cast<std::uint8_t*>(kGeometryDestroyAddress);
+    auto* material = reinterpret_cast<std::uint8_t*>(kMaterialDestroyAddress);
+    auto* list = reinterpret_cast<std::uint8_t*>(
+        kMaterialListDeinitializeAddress);
+    auto* texture = reinterpret_cast<std::uint8_t*>(kTextureDestroyAddress);
+    constexpr const char* geometrySignature =
+        "56 8B 74 24 08 66 8B 46 0E 0F BF C8 49";
+    constexpr const char* materialSignature =
+        "56 8B 74 24 08 66 8B 46 18 66 3D 01 00";
+    constexpr const char* listSignature =
+        "55 8B 6C 24 08 57 8B 7D 00 85 FF";
+    constexpr const char* textureSignature =
+        "56 8B 74 24 08 8B 56 54 4A 8B C2 89 56 54";
+    if (!MatchesExecutablePatternAt(geometry, geometrySignature) ||
+        !MatchesExecutablePatternAt(material, materialSignature) ||
+        !MatchesExecutablePatternAt(list, listSignature) ||
+        !MatchesExecutablePatternAt(texture, textureSignature)) {
+        Log("RW DESTRUCTION GUARD disabled: GTA entries are unreadable or already detoured");
+        return false;
+    }
+
+    g_textureDestroyHook = new (std::nothrow) TextureDestroyHook(
+        reinterpret_cast<TextureDestroyFn>(texture),
+        &TextureDestroyReplacement, false);
+    g_materialDestroyHook = new (std::nothrow) MaterialDestroyHook(
+        reinterpret_cast<MaterialDestroyFn>(material),
+        &MaterialDestroyReplacement, false);
+    g_materialListDeinitializeHook =
+        new (std::nothrow) MaterialListDeinitializeHook(
+            reinterpret_cast<MaterialListDeinitializeFn>(list),
+            &MaterialListDeinitializeReplacement, false);
+    g_geometryDestroyHook = new (std::nothrow) GeometryDestroyHook(
+        reinterpret_cast<GeometryDestroyFn>(geometry),
+        &GeometryDestroyReplacement, false);
+    const bool installed = g_textureDestroyHook && g_materialDestroyHook &&
+        g_materialListDeinitializeHook && g_geometryDestroyHook &&
+        g_textureDestroyHook->install() &&
+        g_materialDestroyHook->install() &&
+        g_materialListDeinitializeHook->install() &&
+        g_geometryDestroyHook->install();
+    if (!installed) {
+        delete g_geometryDestroyHook;
+        delete g_materialListDeinitializeHook;
+        delete g_materialDestroyHook;
+        delete g_textureDestroyHook;
+        g_geometryDestroyHook = nullptr;
+        g_materialListDeinitializeHook = nullptr;
+        g_materialDestroyHook = nullptr;
+        g_textureDestroyHook = nullptr;
+        Log("RW DESTRUCTION GUARD disabled: transactional kthook installation failed");
+        return false;
+    }
+
+    Log("RW DESTRUCTION GUARD enabled: geometry=%p material=%p list=%p texture=%p; mode=owner-boundary preflight",
+        geometry, material, list, texture);
+    return true;
+}
+
 bool InstallRenderAlphaGuard() noexcept {
     auto* renderAlphaAtomic = reinterpret_cast<std::uint8_t*>(
         kRenderAlphaAtomicAddress);
@@ -1988,7 +2365,7 @@ void OpenLog() {
 }
 
 void Initialize() {
-    Log("RenderAlphaFix 1.2 initializing from GTA GameLoop; "
+    Log("RenderAlphaFix 1.3 initializing from GTA GameLoop; "
         "mode=SA-MP object repair + invalid-object quarantine + "
         "RenderWare use-site guards + zero-allocation alpha guard + "
         "narrow tag invariant guards");
@@ -2003,6 +2380,7 @@ void Initialize() {
 
     InstallRenderAlphaGuard();
     InstallGeometrySphereGuards();
+    InstallDestructionGuards();
     InstallTagInvariantGuards();
     SyntheticTests();
     SchedulingSelfTest();
@@ -2061,7 +2439,7 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID) {
         g_module = instance;
         DisableThreadLibraryCalls(instance);
         OpenLog();
-        Log("RenderAlphaFix 1.2 ASI LOADED in DllMain; installing GameLoop hook");
+        Log("RenderAlphaFix 1.3 ASI LOADED in DllMain; installing GameLoop hook");
         if (!InstallMainLoopHook()) {
             Log("FATAL: GameLoop hook installation failed; SA-MP repair is inactive");
             OutputDebugStringA("RenderAlphaFix: failed to install GameLoop hook at 0x53E968\n");

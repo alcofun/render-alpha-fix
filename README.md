@@ -14,6 +14,7 @@ The original field report describes a custom SA-MP client crashing at irregular 
 0x00756B89  D3D9 geometry instancing
 0x00749EE4  RpAtomicClone
 0x0049CD77  CTagManager::ResetAlpha
+0x0074DA25  RpMaterialDestroy
 ```
 
 See the [original report and discussion on BlastHack](https://www.blast.hk/threads/256784/).
@@ -21,6 +22,12 @@ See the [original report and discussion on BlastHack](https://www.blast.hk/threa
 The `0x7324B6` dump contains `RpMaterial*=1`, causing GTA to read address `0x00000008`. A later `0x749EE4` dump contains a geometry whose morph-target pointer is null. These are different downstream symptoms of an object resource that is no longer internally consistent.
 
 The `0x49CD77` crash is a separate stock-game invariant failure. GTA can identify an entity as a graffiti tag by its model while that entity has no corresponding entry in `CTagManager`'s 150-entry descriptor table. The original function dereferences the failed lookup without a null check. RenderAlphaFix guards this exact transition and skips only the invalid alpha reset; valid tags continue through the original function.
+
+The `0x74DA25` crash is the first `RpMaterialDestroy` dereference of the
+16-bit reference count at `material+0x18`; the reported null material therefore
+faults at address `0x18`. Version 1.3 adds destruction-boundary preflight for
+`RpGeometryDestroy`, `RpMaterialDestroy`, `_rpMaterialListDeinitialize`, and
+`RwTextureDestroy`.
 
 ## What the fix does
 
@@ -67,6 +74,18 @@ Only rejected objects receive detailed diagnostic records. Each quarantine line 
 Two additional RenderWare use-site guards protect the shared geometry-sphere operations in `_RpAtomicClone` and `RpAtomicSetGeometry`. They validate the minimum first-morph-target sphere invariant immediately before the stock functions dereference it. For malformed geometry they skip only the unsafe sphere refresh: `_RpAtomicClone` continues to its authoritative copy from the source atomic, while `RpAtomicSetGeometry` preserves the atomic's previous sphere. Neither path returns a null atomic, so callers that assume clone success remain compatible.
 
 The GTA alpha-render, geometry-sphere and tag-manager entry points use their fixed GTA San Andreas 1.0 US virtual addresses. Unlike SA-MP module offsets, these do not vary by client revision. Before installing a hook, the plugin verifies the expected original instructions at that address. If another plugin has already detoured a site, RenderAlphaFix leaves that individual guard disabled instead of layering a second hook over it.
+
+The four destruction hooks are installed transactionally. Positive reference
+counts and structurally valid owners continue through the stock functions,
+including shared references (`2 -> 1`). Final-owner paths validate the material
+list header, texture dictionary links, and minimum owned-resource ranges before
+any plugin callback or free can run. A valid material list is still processed by
+the original loop: malformed individual material entries return success from the
+guard while healthy entries retain their normal reference-count and cleanup
+behavior. If the list header itself is malformed, the guard clears its three
+fields and intentionally leaks the untrusted storage rather than passing an
+arbitrary pointer to RenderWare's allocator. No exception is caught and resumed
+halfway through a destructor.
 
 The two mid-function sphere guards use kthook's x86 naked context and support GTA/SA-MP's normal main-thread RenderWare execution path. Third-party mods that invoke `RpAtomicClone` or `RpAtomicSetGeometry` concurrently from worker threads are outside the supported execution model; RenderWare itself is not treated as a thread-safe API here.
 
@@ -124,13 +143,14 @@ R2 and R4 may share compatible compiler patterns, but have not been field-tested
 A successful startup contains:
 
 ```text
-RenderAlphaFix 1.2 ASI LOADED
+RenderAlphaFix 1.3 ASI LOADED
 GAMELOOP HOOK INSTALLED
-RenderAlphaFix 1.2 initializing from GTA GameLoop; mode=SA-MP object repair + invalid-object quarantine + RenderWare use-site guards + zero-allocation alpha guard
+RenderAlphaFix 1.3 initializing from GTA GameLoop; mode=SA-MP object repair + invalid-object quarantine + RenderWare use-site guards + zero-allocation alpha guard
 RENDER ALPHA GUARD enabled
 RW SPHERE GUARD enabled
+RW DESTRUCTION GUARD enabled
 GTA TAG INVARIANT GUARD enabled
-SYNTHETIC SELFTEST PASS: SA-MP material-text invariant; full payload/slot graph; material indices 0..15; RenderWare material limit 152; first morph-target sphere invariant; zero-allocation alpha guard; tag descriptor invariant
+SYNTHETIC SELFTEST PASS: SA-MP material-text invariant; full payload/slot graph; material indices 0..15; RenderWare material limit 152; first morph-target sphere invariant; zero-allocation alpha guard; tag descriptor invariant; destruction refcounts/list bounds; null morph teardown; pool layouts 1000/2100
 SCHEDULING SELFTEST PASS: full 2100-object scan; nearest ordering; ConstructMaterials phase
 SA-MP OBJECT REPAIR enabled by signatures
 ```
@@ -172,7 +192,7 @@ The absence of this line simply means that no matching object state has been obs
 5. Run an extended session on the affected server.
 6. If a repair line appears, retain the complete log and confirm that the game continues normally afterward.
 
-The standalone mock host verifies game-loop hook installation, chaining to the original timer update, both geometry-sphere hooks on valid and null morph targets, and startup self-test execution. Internal self-tests cover the exact three-field SA-MP invariant, payload bounds, the 152-material boundary, alpha preservation/restoration, rejection of the observed `RpMaterial*=1`, null/count/type morph-target failures, invalid RenderWare pointers, both supported pool layouts, complete-pool scanning, and nearest-first ordering without changing live GTA or SA-MP memory.
+The standalone mock host verifies game-loop hook installation, chaining to the original timer update, both geometry-sphere hooks, and the four actual destruction detours. Destruction probes cover null and guard-page materials, shared `2 -> 1` references, mixed valid/null material lists, malformed list detachment, texture dictionary-link rejection, and geometry owner rejection. Internal self-tests additionally cover the exact three-field SA-MP invariant, payload bounds, the 152-material boundary, alpha preservation/restoration, null/count/type morph-target failures, invalid RenderWare pointers, both supported pool layouts, complete-pool scanning, and nearest-first ordering without changing live GTA or SA-MP memory.
 
 ## Building
 
@@ -198,6 +218,14 @@ ctest --test-dir build-tests -C Release --output-on-failure
 ## Limitations
 
 The plugin covers malformed SA-MP object material commands and the object resource graph they create. It does not suppress arbitrary GTA or RenderWare exceptions. Driver failures, global video-memory exhaustion and corruption introduced by unrelated plugins remain outside its scope.
+
+`VirtualQuery` proves committed access and the guards check structural bounds and
+reference counts, but Windows cannot prove that an otherwise plausible pointer
+belongs to RenderWare's allocator. Plugin callbacks can also mutate a valid graph
+after preflight. The destruction guards therefore reduce known invalid-pointer
+and invalid-refcount failure modes; they are not a general heap-integrity system.
+The mock host exercises the hook mechanics, but version 1.3 still requires an
+extended runtime test in the affected GTA/SA-MP client.
 
 Hot-unloading is not supported. The module is pinned until process exit.
 

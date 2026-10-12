@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(RenderAlphaFix VERSION 1.2.0 LANGUAGES C CXX)
+project(RenderAlphaFix VERSION 1.3.0 LANGUAGES C CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
     message(FATAL_ERROR "RenderAlphaFix must be built as a 32-bit Windows DLL")
